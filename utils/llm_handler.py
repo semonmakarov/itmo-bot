@@ -16,7 +16,7 @@ TIMEOUT = 12  # Сокращение таймаута
 async def get_llm_response(session: aiohttp.ClientSession, query: str) -> Dict:
     try:
         payload = {
-            "model": "sonar-pro-chat",
+            "model": "sonar",
             "messages": [
                 {
                     "role": "system", 
