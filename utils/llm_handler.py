@@ -1,79 +1,172 @@
-# utils/llm_handler.py
 import os
 import re
-import aiohttp  # Переходим на асинхронные запросы
+import asyncio
+import aiohttp
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
-from typing import List, Dict
+from functools import lru_cache
 
 load_dotenv()
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+CACHE = {}
+MAX_CONCURRENT_REQUESTS = 10
+sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# Конфигурация производительности
-MAX_TOKENS_RESPONSE = 150  # Ограничение длины ответа
-TIMEOUT = 12  # Сокращение таймаута
+class APIError(Exception):
+    """Custom API exception"""
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+        super().__init__(self.message)
 
-async def get_llm_response(session: aiohttp.ClientSession, query: str) -> Dict:
-    try:
-        payload = {
-            "model": "sonar",
-            "messages": [
-                {
-                    "role": "system", 
-                    "content": f"""Вы эксперт по Университету ИТМО. Формат ответа:
-1. Номер ответа (только цифра)
-2. Краткое объяснение (максимум 2 предложения)
+@lru_cache(maxsize=100)
+def _cache_key(query: str, query_id: int) -> str:
+    return f"{query_id}-{hash(query)}"
 
-Пример: 
-2. Санкт-Петербург - правильный ответ"""
-                },
-                {"role": "user", "content": query}
-            ],
-            "max_tokens": MAX_TOKENS_RESPONSE
-        }
+async def get_llm_response(query: str, retries: int = 3) -> Dict[str, any]:
+    """Асинхронный запрос с кэшированием и повторными попытками"""
+    cache_key = _cache_key(query, id(query))
+    if cache_key in CACHE:
+        return CACHE[cache_key]
 
-        async with session.post(
-            "https://api.perplexity.ai/chat/completions",
-            json=payload,
-            timeout=TIMEOUT
-        ) as response:
+    for attempt in range(retries):
+        try:
+            headers = {
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json"
+            }
             
-            if response.status == 200:
-                result = await response.json()
-                return {
-                    "content": result['choices'][0]['message']['content'],
-                    "sources": result.get('citations', [])[:2]  # Берем только 2 источника
-                }
-            return {"content": "", "sources": []}
+            payload = {
+                "model": "sonar",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """Вы эксперт по Университету ИТМО. Отвечайте на русском языке.
+                                    Формат ответа:
+                                    1. Для вопросов с вариантами: номер правильного ответа
+                                    2. Краткое объяснение (3 предложения)
+                                    3. Источники: ссылки на itmo.ru"""
+                    },
+                    {
+                        "role": "user",
+                        "content": query
+                    }
+                ],
+                "max_tokens": 150,
+                "temperature": 0.3
+            }
 
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {"content": "", "sources": []}
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://api.perplexity.ai/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=15
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            response_data = {
+                                "content": result['choices'][0]['message']['content'],
+                                "sources": result.get('citations', [])[:3]
+                            }
+                            CACHE[cache_key] = response_data
+                            return response_data
+                        else:
+                            raise APIError(response.status, await response.text())
 
-async def process_batch(queries: List[Dict]) -> List[Dict]:
-    connector = aiohttp.TCPConnector(limit_per_host=10)  # Параллельные подключения
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers={
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-    ) as session:
-        tasks = [process_query(session, q) for q in queries]
-        return await asyncio.gather(*tasks)
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    return {}
 
-async def process_query(session: aiohttp.ClientSession, query_data: Dict) -> Dict:
-    response = await get_llm_response(session, query_data["question"])
+def truncate_reasoning(text: str, max_sentences: int = 3) -> str:
+    """Сокращает текст до указанного количества предложений"""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return ' '.join(sentences[:max_sentences]).strip()
+
+def extract_answer_number(text: str) -> Optional[int]:
+    """Извлекает номер ответа с улучшенной обработкой"""
+    patterns = [
+        r'(?:Ответ|Правильный ответ|Вариант)[:\s]*(\d+)',
+        r'\b(?:Выбрать|Выберите)\s*(\d+)',
+        r'\b\d+\s*[).]?\s*(?=\s|$|\.)',
+        r'(?<=\*\*)\d+(?=\*\*)'  # Для выделенных **2**
+    ]
     
-    # Оптимизированное извлечение ответа
-    answer = re.findall(r'\b\d+', response["content"])
-    return {
-        "id": query_data["id"],
-        "answer": int(answer[0]) if answer else None,
-        "reasoning": " ".join(response["content"].split(". ")[:2]),  # Первые 2 предложения
-        "sources": response["sources"]
-    }
+    text = re.sub(r'\*\*', '', text)  # Удаляем выделение
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                num = int(match.group(1))
+                if 1 <= num <= 10:
+                    return num
+            except (ValueError, IndexError):
+                continue
+    
+    # Дополнительная проверка первого числа в тексте
+    first_number = re.search(r'\b(\d+)\b', text)
+    return int(first_number.group(1)) if first_number else None
 
-def extract_answer_number(text: str) -> int:
-    match = re.search(r'\b([1-4])\b', text)
-    return int(match.group(1)) if match else None
+def has_options(query: str) -> bool:
+    """Определяет, содержит ли вопрос варианты ответов"""
+    return bool(re.search(r'\n\d\.\s', query))
+
+def process_query(query: str, query_id: int, has_options: bool, llm_response: Dict) -> Dict[str, any]:
+    """Обработка ответа от API"""
+    try:
+        cleaned_content = re.sub(
+            r'(\[\d+\]|Источники:.*)', 
+            '', 
+            llm_response.get('content', ''), 
+            flags=re.DOTALL
+        ).strip()
+        
+        reasoning = truncate_reasoning(cleaned_content)
+        
+        answer = extract_answer_number(cleaned_content) if has_options else None
+        if has_options and answer is None:
+            raise ValueError(f"Не удалось извлечь ответ для вопроса {query_id}")
+    
+        return {
+            "id": query_id,
+            "answer": answer,
+            "reasoning": f"{reasoning} [Generated by Perplexity]",
+            "sources": llm_response.get('sources', [])[:3]
+        }
+    except Exception as e:
+        raise ValueError(f"Processing error: {str(e)}")
+
+async def process_query_async(query: str, query_id: int, has_options: bool) -> Dict[str, any]:
+    """Асинхронная обработка запроса"""
+    try:
+        llm_response = await get_llm_response(query)
+        return process_query(query, query_id, has_options, llm_response)
+    except Exception as e:
+        return {
+            "id": query_id,
+            "answer": None,
+            "reasoning": f"API Error: {str(e)}",
+            "sources": []
+        }
+
+async def process_questions(questions: List[Dict], batch_size: int = 10) -> List[Dict]:
+    """Параллельная обработка вопросов батчами"""
+    results = []
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i+batch_size]
+        tasks = [
+            process_query_async(
+                q["query"],
+                q["id"],
+                has_options=bool(q["query"].count('\n') > 1)
+            ) for q in batch
+        ]
+        batch_results = await asyncio.gather(*tasks)
+        results.extend(batch_results)
+        await asyncio.sleep(0.5)  # Задержка между батчами
+    return results
