@@ -1,0 +1,10 @@
+# docker-compose.yml (обновлённый)
+version: '3.8'
+
+services:
+  itmo-bot:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY}
