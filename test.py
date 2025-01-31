@@ -5,7 +5,7 @@ import time
 from typing import List, Dict
 
 # Конфигурация
-API_URL = "http://130.193.59.4/api/request"
+API_URL = "http://localhost:8000/api/request"
 OUTPUT_FILE = "test_dataset.json"
 DELAY_BETWEEN_REQUESTS = 1  # в секундах
 
